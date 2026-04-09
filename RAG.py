@@ -1,55 +1,165 @@
 import os
+from pathlib import Path
 from dotenv import load_dotenv
 
 from langchain_community.document_loaders import PyPDFLoader, Docx2txtLoader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
-from langchain.chains import RetrievalQA
-from langchain.prompts import PromptTemplate
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_ollama import ChatOllama
 
+# =========================
+# 1) CONFIGURATION
+# =========================
 load_dotenv()
 
-# 1. Charger les documents
-def load_documents(file_paths):
+DATA_DIR = "data"
+FAISS_DIR = "faiss_index"
+
+USE_OPENAI_FOR_ANSWER = True
+LOCAL_LLM_MODEL = "mistral"
+
+EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+CHAT_MODEL = "gpt-4.1-mini"
+
+
+# =========================
+# 2) CHARGER LES DOCUMENTS
+# =========================
+def load_documents(folder_path: str):
+    folder = Path(folder_path)
+
+    if not folder.exists():
+        raise FileNotFoundError(f"Le dossier '{folder_path}' n'existe pas.")
+
     documents = []
 
-    for path in file_paths:
-        if path.endswith(".pdf"):
-            loader = PyPDFLoader(path)
+    for file_path in folder.iterdir():
+        suffix = file_path.suffix.lower()
+
+        if suffix == ".pdf":
+            loader = PyPDFLoader(str(file_path))
             documents.extend(loader.load())
-        elif path.endswith(".docx"):
-            loader = Docx2txtLoader(path)
+
+        elif suffix == ".docx":
+            loader = Docx2txtLoader(str(file_path))
             documents.extend(loader.load())
+
+    if not documents:
+        raise ValueError(
+            f"Aucun fichier PDF ou DOCX trouvé dans le dossier '{folder_path}'."
+        )
 
     return documents
 
 
-# 2. Découper les documents en chunks
-def split_documents(documents, chunk_size=800, chunk_overlap=150):
+# =========================
+# 3) DECOUPER EN CHUNKS
+# =========================
+def split_documents(documents, chunk_size: int = 1000, chunk_overlap: int = 200):
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size,
-        chunk_overlap=chunk_overlap
+        chunk_overlap=chunk_overlap,
     )
     return splitter.split_documents(documents)
 
 
-# 3. Créer la base vectorielle
-def build_vectorstore(chunks):
-    embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
-    vectorstore = FAISS.from_documents(chunks, embeddings)
+# =========================
+# 4) EMBEDDINGS LOCAUX
+# =========================
+def get_embeddings():
+    return HuggingFaceEmbeddings(
+        model_name=EMBEDDING_MODEL
+    )
+
+
+# =========================
+# 5) CREER OU CHARGER L'INDEX FAISS
+# =========================
+def build_or_load_vectorstore(chunks):
+    embeddings = get_embeddings()
+
+    if os.path.exists(FAISS_DIR):
+        print("Index FAISS existant trouvé. Chargement...")
+        vectorstore = FAISS.load_local(
+            FAISS_DIR,
+            embeddings,
+            allow_dangerous_deserialization=True
+        )
+    else:
+        print("Aucun index trouvé. Création de l'index FAISS...")
+        vectorstore = FAISS.from_documents(chunks, embeddings)
+        vectorstore.save_local(FAISS_DIR)
+        print(f"Index sauvegardé dans '{FAISS_DIR}'.")
+
     return vectorstore
 
 
-# 4. Créer la chaîne RAG
-def build_rag_chain(vectorstore):
-    llm = ChatOpenAI(model="gpt-4.1-mini", temperature=0)
+# =========================
+# 6) RECHERCHE SIMPLE
+# =========================
+def retrieve_documents(vectorstore, question: str, k: int = 4):
+    retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
+    docs = retriever.invoke(question)
+    return docs
 
-    prompt_template = """
-Tu es un assistant scientifique.
+
+# =========================
+# 7) REPONSE LOCALE SANS OPENAI
+# =========================
+def local_answer(question: str, docs):
+    if not docs:
+        return "Je ne trouve pas d'information pertinente dans les documents."
+
+    answer = []
+    answer.append(
+        "Je n'utilise pas de LLM ici : voici les passages les plus pertinents retrouvés pour ta question.\n"
+    )
+
+    for i, doc in enumerate(docs, start=1):
+        source = doc.metadata.get("source", "Source inconnue")
+        page = doc.metadata.get("page", "N/A")
+        excerpt = doc.page_content[:700].replace("\n", " ").strip()
+
+        answer.append(
+            f"[Passage {i}] Source: {source} | Page: {page}\n{excerpt}\n"
+        )
+
+    return "\n".join(answer)
+
+
+# =========================
+# 8) REPONSE AVEC Mistral
+# =========================
+def generate_answer(question: str, docs):
+    if not docs:
+        return "Je ne trouve pas d'information pertinente dans les documents."
+
+    llm = ChatOllama(
+        model="mistral",   # ou "llama3"
+        temperature=0
+    )
+
+    context = "\n\n".join(
+        [
+            f"Source: {doc.metadata.get('source', 'Source inconnue')} | "
+            f"Page: {doc.metadata.get('page', 'N/A')}\n{doc.page_content}"
+            for doc in docs
+        ]
+    )
+
+    prompt = f"""
+Tu es un assistant scientifique spécialisé dans les récepteurs FFA/GPCR.
+
 Réponds uniquement à partir du contexte fourni.
-Si l'information n'est pas présente dans le contexte, dis-le clairement.
-Ajoute une réponse structurée et mentionne les sources utilisées.
+Si l'information n'est pas dans le contexte, dis clairement :
+"Je ne trouve pas cette information dans les documents fournis."
+
+La réponse doit être :
+- claire
+- précise
+- structurée
+- fidèle aux documents
 
 Contexte :
 {context}
@@ -60,51 +170,80 @@ Question :
 Réponse :
 """
 
-    prompt = PromptTemplate(
-        template=prompt_template,
-        input_variables=["context", "question"]
-    )
-
-    qa_chain = RetrievalQA.from_chain_type(
-        llm=llm,
-        retriever=vectorstore.as_retriever(search_kwargs={"k": 3}),
-        chain_type="stuff",
-        chain_type_kwargs={"prompt": prompt},
-        return_source_documents=True
-    )
-
-    return qa_chain
+    response = llm.invoke(prompt)
+    return response.content
 
 
-# 5. Pipeline complète
-def rag_pipeline(file_paths, question):
-    documents = load_documents(file_paths)
+# =========================
+# 9) AFFICHER LES SOURCES
+# =========================
+def print_sources(context_docs):
+    print("\n" + "=" * 80)
+    print("SOURCES UTILISEES")
+    print("=" * 80)
+
+    for i, doc in enumerate(context_docs, start=1):
+        source = doc.metadata.get("source", "Source inconnue")
+        page = doc.metadata.get("page", "N/A")
+
+        print(f"\n--- Source {i} ---")
+        print(f"Fichier : {source}")
+        print(f"Page   : {page}")
+        print("Extrait :")
+        print(doc.page_content[:600].replace("\n", " "))
+        print()
+
+
+# =========================
+# 10) MAIN
+# =========================
+def main():
+    print("Chargement des documents...")
+    documents = load_documents(DATA_DIR)
+    print(f"{len(documents)} document(s)/page(s) chargé(s).")
+
+    print("Découpage en chunks...")
     chunks = split_documents(documents)
-    vectorstore = build_vectorstore(chunks)
-    qa_chain = build_rag_chain(vectorstore)
+    print(f"{len(chunks)} chunk(s) créés.")
 
-    result = qa_chain.invoke({"query": question})
+    print("Création / chargement du vector store...")
+    vectorstore = build_or_load_vectorstore(chunks)
 
-    answer = result["result"]
-    sources = result["source_documents"]
+    print("\nAssistant RAG prêt.")
+    print("Tape ta question. Tape 'quit' pour arrêter.\n")
 
-    return answer, sources
+    while True:
+        question = input("Question : ").strip()
+
+        if question.lower() in {"quit", "exit", "q"}:
+            print("Fin du programme.")
+            break
+
+        if not question:
+            print("Merci d'entrer une question.\n")
+            continue
+
+        try:
+            docs = retrieve_documents(vectorstore, question, k=4)
+
+            if USE_OPENAI_FOR_ANSWER:
+                answer = generate_answer(question, docs)
+            else:
+                answer = local_answer(question, docs)
+
+            print("\n" + "=" * 80)
+            print("REPONSE")
+            print("=" * 80)
+            print(answer)
+
+            if docs:
+                print_sources(docs)
+
+            print("\n")
+
+        except Exception as e:
+            print(f"\nErreur pendant l'exécution : {e}\n")
 
 
 if __name__ == "__main__":
-    files = [
-        "data/article_ffa4.pdf",
-        "data/notes_gpcr.docx"
-    ]
-
-    question = "Quel est le rôle du récepteur FFA4 ?"
-
-    answer, sources = rag_pipeline(files, question)
-
-    print("Réponse :")
-    print(answer)
-    print("\nSources :")
-    for i, doc in enumerate(sources, 1):
-        print(f"\nSource {i}:")
-        print(doc.metadata)
-        print(doc.page_content[:500])
+    main()
