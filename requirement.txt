@@ -1,8 +1,12 @@
-langchain
+streamlit
+python-dotenv
 langchain-community
-langchain-openai
+langchain-text-splitters
+langchain-ollama
 faiss-cpu
+sentence-transformers
 pypdf
 docx2txt
-python-dotenv
-streamlit
+ddgs
+torch
+torchvision
